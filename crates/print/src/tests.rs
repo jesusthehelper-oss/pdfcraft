@@ -542,6 +542,20 @@ fn printer_papers_come_from_the_ppd() {
     assert_eq!((spool::paper_of_size(&labels, (162.0, 90.0)), spool::paper_of_size(&labels, (90.0, 162.0))), (Some(1), Some(0)));
     assert_eq!(spool::paper_of_size(&papers, (613.0, 792.0)), None);
     assert_eq!(spool::paper_of_size(&papers, (f64::NAN, 792.0)), None);
+    // A label driver's stock rounded to whole dots is the nearest paper, never another office size.
+    let mm = |v: f64| v * 72.0 / 25.4;
+    let rounded = spool::parse_ppd_papers(&format!(
+        "*PaperDimension Letter/Letter: \"612 792\"\n*PaperDimension w284h425/4.0\"x6.0\": \"{} {}\"\n*PaperDimension 99012/99012 Large Address: \"{} {}\"\n",
+        mm(100.1),
+        mm(150.1),
+        mm(35.7),
+        mm(88.5)
+    ));
+    assert_eq!(spool::paper_of_size(&rounded, (288.0, 432.0)), None, "not the same paper");
+    assert_eq!(spool::nearest_paper(&rounded, (288.0, 432.0)), Some(1), "4 × 6 in on the 100.1 × 150.1 mm stock");
+    assert_eq!(spool::nearest_paper(&rounded, (252.28, 102.33)), Some(2), "a 89.0 × 36.1 mm stamp on the 99012 label, either way round");
+    assert_eq!(spool::nearest_paper(&rounded, (mm(210.0), mm(297.0))), None, "A4 is not Letter");
+    assert_eq!(spool::nearest_paper(&rounded, (f64::NAN, 432.0)), None);
     assert!(spool::parse_ppd_papers("").is_empty());
     assert!(spool::parse_ppd_papers("*PaperDimension").is_empty());
     let many: String = (0..500).map(|i| format!("*PaperDimension P{i}: \"100 200\"\n")).collect();
@@ -811,5 +825,26 @@ fn imposed_pages_preserve_large_user_unit_matrices() {
         for (actual, expected) in to_sheet(raw).into_iter().zip(expected) {
             assert!((actual - expected).abs() < 1e-9, "unit={unit}: {actual} != {expected}");
         }
+    }
+}
+
+#[test]
+fn a_custom_paper_is_named_for_cups_in_millimetres() {
+    let mm = 72.0 / 25.4;
+    assert_eq!(crate::cups_custom_media((100.0 * mm, 150.0 * mm)).as_deref(), Some("Custom.100x150mm"));
+    assert_eq!(crate::cups_custom_media((150.0 * mm, 100.0 * mm)).as_deref(), Some("Custom.100x150mm"), "portrait");
+    assert_eq!(crate::cups_custom_media((300.0, 400.0)).as_deref(), Some("Custom.105.8x141.1mm"));
+    assert_eq!(crate::cups_custom_media((f64::NAN, 400.0)), None);
+}
+
+#[test]
+fn a_custom_paper_size_is_read_in_any_unit() {
+    let close = |a: Option<(f64, f64)>, b: (f64, f64)| a.is_some_and(|a| (a.0 - b.0).abs() < 0.01 && (a.1 - b.1).abs() < 0.01);
+    assert!(close(crate::parse_paper_size("100x150mm"), (283.46, 425.2)));
+    assert!(close(crate::parse_paper_size(" 10 × 15 CM "), (283.46, 425.2)));
+    assert!(close(crate::parse_paper_size("4x6in"), (288.0, 432.0)));
+    assert!(close(crate::parse_paper_size("600x400pt"), (600.0, 400.0)), "either way round");
+    for bad in ["A4", "100x150", "x150mm", "10x150mm", "100x6000in", "NaNx150mm", "infx150mm", "-100x150mm"] {
+        assert_eq!(crate::parse_paper_size(bad), None, "{bad}");
     }
 }

@@ -120,18 +120,23 @@ impl Automation {
             "form-fields-only" => Content::FormFieldsOnly,
             c => return Err(bad(format!("unknown comments_forms {c:?}"))),
         };
-        // The printer's own paper sizes (its PPD's, on CUPS): a paper may be one of them, by
-        // keyword or label, and a job on a size the printer has names it as the job's media.
+        // The printer's own paper sizes (its PPD's on CUPS, its driver's on Windows): a paper may
+        // be one of them, by keyword or label, and a job on a size the printer has names it as the
+        // job's media.
         let own = match a.opt_str("printer")? {
             Some(printer) if printer != "default" => spool::printer_papers(printer),
             _ => Vec::new(),
         };
-        // The sheet, and the index of the standard size or of the printer's own it was named by.
-        let (paper, standard, chosen) = match a.opt_str("paper")? {
+        // The sheet, the index of the standard size or of the printer's own it was named by, and
+        // whether it was given as a size (`100x150mm`).
+        let (paper, standard, chosen, custom) = match a.opt_str("paper")? {
             // None named: the printer's default size when its driver reports one, else US Letter.
-            None => {
-                own.iter().position(|q| q.default).and_then(|i| own.get(i).map(|q| (q.size, None, Some(i)))).unwrap_or((PAPERS[0].1, Some(0), None))
-            }
+            None => own.iter().position(|q| q.default).and_then(|i| own.get(i).map(|q| (q.size, None, Some(i), false))).unwrap_or((
+                PAPERS[0].1,
+                Some(0),
+                None,
+                false,
+            )),
             Some(p) => {
                 let standard = PAPERS.iter().position(|(n, _)| {
                     n.eq_ignore_ascii_case(p)
@@ -139,25 +144,37 @@ impl Automation {
                         || n.split(" (").next().is_some_and(|name| name.eq_ignore_ascii_case(p))
                 });
                 let chosen = own.iter().position(|q| q.key.eq_ignore_ascii_case(p) || q.label.eq_ignore_ascii_case(p));
-                match (standard.and_then(|i| PAPERS.get(i)), chosen.and_then(|i| own.get(i))) {
-                    (Some(x), _) => (x.1, standard, None),
-                    (None, Some(q)) => (q.size, None, chosen),
-                    (None, None) => {
+                match (standard.and_then(|i| PAPERS.get(i)), chosen.and_then(|i| own.get(i)), print::parse_paper_size(p)) {
+                    (Some(x), _, _) => (x.1, standard, None, false),
+                    (None, Some(q), _) => (q.size, None, chosen, false),
+                    (None, None, Some(size)) => (size, None, None, true),
+                    (None, None, None) => {
+                        let theirs = if own.is_empty() {
+                            ", one of the printer's own sizes (printer_papers)".to_string()
+                        } else {
+                            format!(
+                                ", one of the printer's own sizes ({}; printer_papers)",
+                                own.iter().map(|q| q.label.as_str()).collect::<Vec<_>>().join(", ")
+                            )
+                        };
                         return Err(bad(format!(
-                            "unknown paper {p:?}; choose one of {}, or one of the printer's own sizes (printer_papers)",
+                            "unknown paper {p:?}; choose one of {}{theirs}, or give a custom size such as 100x150mm",
                             PAPERS.iter().map(|(name, _)| *name).collect::<Vec<_>>().join(", ")
                         )));
                     }
                 }
             }
         };
-        // The media the job names: the printer's own keyword for the chosen size, else the CUPS
-        // name of the standard size, as the Print dialog does.
+        // The media the job names: the printer's own keyword for the chosen size (for a size given
+        // in numbers, also the printer's own a few millimetres off), else the CUPS name of the
+        // standard size or of the custom one, as the Print dialog does.
         let media = chosen
             .or_else(|| spool::paper_of_size(&own, paper))
+            .or_else(|| if custom { spool::nearest_paper(&own, paper) } else { None })
             .and_then(|i| own.get(i))
             .map(|q| q.key.clone())
-            .or_else(|| standard.and_then(print::cups_media).map(str::to_string));
+            .or_else(|| standard.and_then(print::cups_media).map(str::to_string))
+            .or_else(|| if custom { print::cups_custom_media(paper) } else { None });
         // Print as image (Acrobat's Advanced Print Setup): pictures at `dpi`, grey when
         // `grayscale` is also asked for.
         let raster = if a.opt_bool("as_image")?.unwrap_or(false) {

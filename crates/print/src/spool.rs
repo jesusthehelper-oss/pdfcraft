@@ -94,7 +94,10 @@ pub fn printer_papers(printer: &str) -> Vec<PrinterPaper> {
     }
     #[cfg(windows)]
     {
-        craft_print::printer_papers(printer).into_iter().map(|p| PrinterPaper { key: p.key, label: p.label, size: p.size, default: p.default }).collect()
+        craft_print::printer_papers(printer)
+            .into_iter()
+            .map(|p| PrinterPaper { key: p.key, label: p.label, size: p.size, default: p.default })
+            .collect()
     }
     #[cfg(not(any(all(unix, not(target_arch = "wasm32")), windows)))]
     {
@@ -173,6 +176,31 @@ pub fn parse_ppd_papers(ppd: &str) -> Vec<PrinterPaper> {
 pub fn paper_of_size(papers: &[PrinterPaper], size: (f64, f64)) -> Option<usize> {
     let same = |p: &PrinterPaper, (w, h): (f64, f64)| (p.size.0 - w).abs() <= 0.5 && (p.size.1 - h).abs() <= 0.5;
     papers.iter().position(|p| same(p, size)).or_else(|| papers.iter().position(|p| same(p, (size.1, size.0))))
+}
+
+/// The printer's own paper nearest a sheet of `size` points (either way round) when none is its
+/// size ([`paper_of_size`]): each side within 3 mm, or 2 % of the side when that is more, at most
+/// 6 mm; the smallest difference first, on a tie the driver's order. A label driver rounds its
+/// stock to whole dots (a 203 dpi printer's 4 × 6 in is 100.1 × 150.1 mm, a DYMO 99012 label
+/// 35.7 × 88.5 mm), so a label PDF is never exactly its size; office sizes are further apart.
+/// craft-print picks the same paper on Windows and shrinks the sheet onto it.
+pub fn nearest_paper(papers: &[PrinterPaper], size: (f64, f64)) -> Option<usize> {
+    let mm = 72.0 / 25.4;
+    let near = |side: f64| (side * 0.02).clamp(3.0 * mm, 6.0 * mm);
+    let (w, h) = (size.0.min(size.1), size.0.max(size.1));
+    if !(w.is_finite() && h.is_finite() && w > 0.0) {
+        return None;
+    }
+    papers
+        .iter()
+        .enumerate()
+        .filter_map(|(i, p)| {
+            let (pw, ph) = (p.size.0.min(p.size.1), p.size.0.max(p.size.1));
+            let (dw, dh) = ((pw - w).abs(), (ph - h).abs());
+            (pw > 0.0 && dw <= near(w) && dh <= near(h)).then_some((i, dw + dh))
+        })
+        .min_by(|a, b| a.1.total_cmp(&b.1).then(a.0.cmp(&b.0)))
+        .map(|(i, _)| i)
 }
 
 pub fn submit(pdf: &[u8], job: &Job) -> Result<String, crate::PrintError> {

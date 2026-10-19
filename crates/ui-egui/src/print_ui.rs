@@ -75,7 +75,8 @@ pub struct PrintDraft {
     /// Print as image (Acrobat's Advanced Print Setup) at `dpi`.
     pub as_image: bool,
     pub dpi: f64,
-    /// Index into the Paper list: the standard sizes, then the printer's own.
+    /// Index into the Paper list: the standard sizes, then the printer's own; or
+    /// [`CUSTOM_PAPER`] for `custom_paper`.
     pub paper: usize,
     /// The printer's own paper sizes and the printer they were read for
     /// ([`spool::printer_papers`]); `None` until a printer is chosen.
@@ -83,6 +84,8 @@ pub struct PrintDraft {
     /// Whether `printer_papers` was read since the dialog opened: a driver's stock (a label
     /// printer's one "User defined" size) changes between prints, so each opening reads again.
     pub papers_read: bool,
+    /// The Custom size paper, in points (width, height).
+    pub custom_paper: (f64, f64),
     /// The sheet shown in the preview (0-based).
     pub sheet: usize,
     pub current_page: usize,
@@ -138,6 +141,7 @@ impl Default for PrintDraft {
             paper: 0,
             printer_papers: None,
             papers_read: false,
+            custom_paper: PAPERS[0].1,
             sheet: 0,
             current_page: 0,
             driver_options: None,
@@ -151,7 +155,24 @@ impl Default for PrintDraft {
     }
 }
 
+/// The Paper list's last entry, after [`PAPERS`] and the printer's own sizes: a size typed in.
+/// Not an index into either list, however many sizes the printer has.
+pub const CUSTOM_PAPER: usize = usize::MAX;
+
 impl PrintDraft {
+    /// Choose the paper of this size: the standard one or the printer's own it is
+    /// ([`Self::paper_index`]), else the printer's own a few millimetres off (a label driver's
+    /// stock is rounded to whole dots, [`spool::nearest_paper`]), else Custom size.
+    pub fn set_paper_size(&mut self, size: (f64, f64)) {
+        match self.paper_index(size).or_else(|| spool::nearest_paper(self.own_papers(), size).map(|i| PAPERS.len() + i)) {
+            Some(i) => self.paper = i,
+            None => {
+                self.custom_paper = (size.0.min(size.1), size.0.max(size.1));
+                self.paper = CUSTOM_PAPER;
+            }
+        }
+    }
+
     /// The engine settings for this draft (page count and labels from the document).
     pub fn settings(&self, count: usize, labels: &[String]) -> Result<print::Settings, String> {
         if self.handling == Handling::Multiple && self.order == PageOrder::CutStack && self.duplex != spool::Duplex::Off {
@@ -253,6 +274,9 @@ impl PrintDraft {
 
     /// The chosen paper's size (points, portrait); a stale index reads as the first size.
     pub fn paper_size(&self) -> (f64, f64) {
+        if self.paper == CUSTOM_PAPER {
+            return self.custom_paper;
+        }
         match self.paper.checked_sub(PAPERS.len()) {
             None => PAPERS.get(self.paper).map_or(PAPERS[0].1, |p| p.1),
             Some(i) => self.own_papers().get(i).map_or(PAPERS[0].1, |p| p.size),
@@ -260,8 +284,11 @@ impl PrintDraft {
     }
 
     /// The chosen paper as the dialog names it: a standard size translated, one of the
-    /// printer's own as its driver names it, with its size.
+    /// printer's own as its driver names it, with its size; Custom size translated.
     pub fn paper_name(&self) -> String {
+        if self.paper == CUSTOM_PAPER {
+            return tl!("Custom size").to_string();
+        }
         match self.paper.checked_sub(PAPERS.len()).map(|i| self.own_papers().get(i)) {
             Some(Some(p)) => format!("{} ({})", p.label, self.units.size(p.size.0, p.size.1)),
             Some(None) => tl!(PAPERS[0].0).to_string(),
@@ -277,14 +304,18 @@ impl PrintDraft {
 
     /// The `media` the job names, so the spooler feeds the sheet the PDF was laid out on rather
     /// than the queue's default: the printer's own keyword for the chosen size when it has one,
-    /// else the CUPS name of the standard size ([`print::cups_media`]).
+    /// else the CUPS name of the standard size ([`print::cups_media`]), or of the Custom size
+    /// ([`print::cups_custom_media`]).
     pub fn media(&self) -> Option<String> {
         let own = self.own_papers();
-        let index = match self.paper.checked_sub(PAPERS.len()) {
+        let index = match self.paper.checked_sub(PAPERS.len()).filter(|_| self.paper != CUSTOM_PAPER) {
             Some(i) => Some(i),
             None => spool::paper_of_size(own, self.paper_size()),
         };
-        index.and_then(|i| own.get(i)).map(|p| p.key.clone()).or_else(|| print::cups_media(self.paper).map(str::to_string))
+        let fallback = || {
+            if self.paper == CUSTOM_PAPER { print::cups_custom_media(self.custom_paper) } else { print::cups_media(self.paper).map(str::to_string) }
+        };
+        index.and_then(|i| own.get(i)).map(|p| p.key.clone()).or_else(fallback)
     }
 }
 
@@ -992,7 +1023,7 @@ pub(crate) fn body(
                 let wanted = d.printer.clone().filter(|_| !browser);
                 if !d.papers_read || d.printer_papers.as_ref().map(|(read_for, _)| read_for) != wanted.as_ref() {
                     // The size chosen so far: on the last printer's list when it was one of its own.
-                    let size = match (d.paper.checked_sub(PAPERS.len()), &d.printer_papers) {
+                    let size = match (d.paper.checked_sub(PAPERS.len()).filter(|_| d.paper != CUSTOM_PAPER), &d.printer_papers) {
                         (Some(i), Some((_, last))) => last.get(i).map_or(PAPERS[0].1, |p| p.size),
                         _ => d.paper_size(),
                     };
@@ -1001,7 +1032,10 @@ pub(crate) fn body(
                         (p, papers)
                     });
                     d.papers_read = true;
-                    d.paper = d.paper_after_read(size);
+                    // A size typed in stays: it is the person's, not the last printer's.
+                    if d.paper != CUSTOM_PAPER {
+                        d.paper = d.paper_after_read(size);
+                    }
                 }
                 let before = d.paper;
                 let own = d.own_papers_listed();
@@ -1016,6 +1050,13 @@ pub(crate) fn body(
                     for (i, label) in &own {
                         ui.selectable_value(&mut d.paper, *i, label.as_str());
                     }
+                    // Starts from the paper chosen before, to be changed from there.
+                    if ui.selectable_label(d.paper == CUSTOM_PAPER, tl!("Custom size")).clicked() && d.paper != CUSTOM_PAPER {
+                        let (w, h) = d.paper_size();
+                        d.custom_paper = (w.min(h), w.max(h));
+                        d.paper = CUSTOM_PAPER;
+                        d.sheet = 0;
+                    }
                 });
                 // Label stock gets the label layout (cut, turned upright, fitted).
                 if d.paper != before && d.paper == print::LABEL_PAPER {
@@ -1023,6 +1064,32 @@ pub(crate) fn body(
                     d.sheet = 0;
                 }
                 ui.end_row();
+                if d.paper == CUSTOM_PAPER {
+                    ui.label("");
+                    ui.horizontal(|ui| {
+                        let (units, k) = (d.units, d.units.per_point());
+                        // From an inch (the smallest sheet the layout takes) to 5 m (a banner roll).
+                        let field = |ui: &mut egui::Ui, v: &mut f64| {
+                            ui.add(
+                                egui::DragValue::new(v)
+                                    .range(72.0 * k..=14_173.0 * k)
+                                    .speed(units.speed())
+                                    .fixed_decimals(units.decimals())
+                                    .suffix(format!(" {}", units.label())),
+                            )
+                        };
+                        let (mut w, mut h) = (d.custom_paper.0 * k, d.custom_paper.1 * k);
+                        ui.label(tl!("Width:"));
+                        let rw = field(ui, &mut w);
+                        ui.label(tl!("Height:"));
+                        let rh = field(ui, &mut h);
+                        if rw.changed() || rh.changed() {
+                            d.custom_paper = (w / k, h / k);
+                            d.sheet = 0;
+                        }
+                    });
+                    ui.end_row();
+                }
             });
             // Windows says which drivers can't print two-sided as they're asked; they keep their
             // own setting, even when Two-sided is Off.
@@ -1043,11 +1110,10 @@ pub(crate) fn body(
             if let Some(&source) = sizes.get(d.current_page) {
                 ui.horizontal_wrapped(|ui| {
                     ui.label(crate::i18n::fmt(tl!("PDF page: {size}"), &[("size", &d.units.size(source.0, source.1))]));
-                    let matched = d.paper_index(source);
-                    if ui.add_enabled(matched.is_some(), egui::Button::new(tl!("Match page at 100%"))).clicked()
-                        && let Some(paper) = matched
-                    {
-                        d.paper = paper;
+                    // A page of no size in the list gets the printer's own a few millimetres off, else
+                    // a Custom size paper of its own size.
+                    if ui.button(tl!("Match page at 100%")).clicked() {
+                        d.set_paper_size(source);
                         d.handling = Handling::Size;
                         d.size = SizeMode::Actual;
                         d.orientation = Orientation::Auto;

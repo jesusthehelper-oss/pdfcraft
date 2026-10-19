@@ -236,6 +236,9 @@ fn print_dialog_shows_the_printer_driver_options() {
     {
         let d = &mut h.state_mut().print_draft;
         d.printer = Some("Test_Queue".into());
+        // US Letter, whatever size the machine's default printer started the dialog on (on
+        // Windows its driver's sizes are read, and an A4 printer starts it on A4).
+        d.paper = 0;
         d.driver_options = Some(("Test_Queue".into(), vec![tray]));
         d.driver_choices.insert("InputSlot".into(), "Tray2".into());
         d.show_driver_options = true;
@@ -464,18 +467,75 @@ fn architectural_page_can_be_matched_at_100_percent() {
 }
 
 #[test]
-fn custom_page_cannot_silently_match_a_standard_paper() {
+fn a_page_of_no_standard_size_gets_a_custom_paper_of_its_size() {
     let mut h = harness();
     assert!(h.state_mut().execute("print.dialog"));
     h.run_steps(3);
-    // The 300 x 400 pt fixture is not a standard sheet.
+    // The 300 x 400 pt fixture is not a standard sheet: matching it never picks a near one.
     assert!(pdfcraft_engine::print::matching_paper((300.0, 400.0)).is_none());
-    let before = h.state().print_draft.clone();
-    assert!(h.get_by_label("Match page at 100%").accesskit_node().is_disabled());
     h.get_by_label("Match page at 100%").click();
     h.run_steps(3);
-    assert_eq!(h.state().print_draft.paper, before.paper);
-    assert_eq!(h.state().print_draft.size, before.size);
+    h.get_by_value("Custom size");
+    let d = &h.state().print_draft;
+    let settings = d.settings(1, &[]).unwrap();
+    assert_eq!(settings.paper, (300.0, 400.0));
+    assert_eq!(settings.layout, pdfcraft_engine::print::Layout::Size(pdfcraft_engine::print::SizeMode::Actual));
+    // CUPS is asked for that sheet, not the queue's default paper.
+    let job = d.job("t");
+    assert!(job.options.contains(&("media".to_string(), "Custom.105.8x141.1mm".to_string())), "{:?}", job.options);
+}
+
+/// A label PDF is never exactly the size a label driver lists (its stock is rounded to whole
+/// dots), so Match page at 100% picks the printer's own label a few millimetres off rather than a
+/// Custom size the driver may not take; a printer with nothing near gets the Custom size.
+#[test]
+fn match_page_picks_the_printers_label_a_few_millimetres_off() {
+    use pdfcraft_engine::print::{PAPERS, spool};
+    use pdfcraft_ui_egui::PrintDraft;
+    let paper = |key: &str, size: (f64, f64)| spool::PrinterPaper { key: key.into(), label: key.into(), size, default: false };
+    let mm = |v: f64| v * 72.0 / 25.4;
+    // DYMO LabelWriter 550: 99012 Large Address is 35.7 × 88.5 mm, fed across.
+    let mut d = PrintDraft { printer: Some("DYMO LabelWriter 550".into()), ..Default::default() };
+    d.printer_papers = Some(("DYMO LabelWriter 550".into(), vec![paper("w79h252", (mm(28.0), mm(89.0))), paper("99012", (mm(35.7), mm(88.5)))]));
+    // A La Poste stamp page: 89.0 × 36.1 mm (252.28 × 102.33 pt).
+    d.set_paper_size((252.28, 102.33));
+    assert_eq!(d.paper, PAPERS.len() + 1, "the 99012 label");
+    assert_eq!(d.media().as_deref(), Some("99012"));
+    // Munbyn ITPP130 (203 dpi): its 4.0"x6.0" is 100.1 × 150.1 mm. A 4 × 6 in page is the standard
+    // label size first (craft-print then puts it on the driver's 100.1 × 150.1 mm); a page of the
+    // driver's own size is its own paper.
+    d.printer = Some("ITPP130 Printer".into());
+    d.printer_papers = Some(("ITPP130 Printer".into(), vec![paper("4.0\"x6.0\"", (mm(100.1), mm(150.1)))]));
+    d.set_paper_size((288.0, 432.0));
+    assert_eq!(d.paper, pdfcraft_engine::print::LABEL_PAPER);
+    d.set_paper_size((mm(150.0), mm(100.0)));
+    assert_eq!(d.paper, PAPERS.len(), "a few millimetres off the driver's own");
+    // An office printer has nothing near a 300 × 400 pt page: Custom size of the page's size.
+    d.printer_papers = Some(("ITPP130 Printer".into(), vec![paper("Letter", (612.0, 792.0))]));
+    d.set_paper_size((400.0, 300.0));
+    assert_eq!((d.paper, d.paper_size()), (pdfcraft_ui_egui::CUSTOM_PAPER, (300.0, 400.0)));
+    // A standard size still comes first.
+    d.set_paper_size((595.28, 841.89));
+    assert_eq!(d.paper_name(), "A4");
+}
+
+#[test]
+fn a_custom_paper_size_is_typed_in_the_chosen_unit() {
+    let mut h = harness();
+    assert!(h.state_mut().execute("print.dialog"));
+    h.run_steps(3);
+    {
+        let d = &mut h.state_mut().print_draft;
+        d.units = pdfcraft_ui_egui::units::Unit::Millimetres;
+        d.paper = pdfcraft_ui_egui::CUSTOM_PAPER;
+        d.custom_paper = (100.0 / 25.4 * 72.0, 150.0 / 25.4 * 72.0);
+    }
+    h.run_steps(3);
+    h.get_by_value("Custom size");
+    h.get_by_value("100.0 mm");
+    h.get_by_value("150.0 mm");
+    let (w, h_pt) = h.state().print_draft.settings(1, &[]).unwrap().paper;
+    assert!((w - 283.46).abs() < 0.01 && (h_pt - 425.2).abs() < 0.01);
 }
 
 /// A driver Windows reports without two-sided printing keeps its own setting whatever Two-sided
